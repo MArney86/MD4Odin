@@ -24,87 +24,55 @@ package md4o
  * IN THE SOFTWARE.
  */
 
-TRUE :: true
-FALSE :: false
+ import mem "core:mem"
+ import utf8 "core:unicode/utf8"
 
-MD4O_USE_UTF16 :: FALSE
-MD4O_USE_ASCII :: FALSE
+md_parse :: proc(text: string, size: MD_SIZE, parser: ^MD_PARSER, userdata: rawptr) -> i32 {
+    ctx : MD_CTX
+    i: i32
+    ret: i32
 
-when !MD4O_USE_ASCII && !MD4O_USE_UTF16 {
-    MD4O_USE_UTF8 :: TRUE
-} else {
-    MD4O_USE_UTF8 :: FALSE
-}
-
-// Magic to support UTF-16. Note that in order to use it, you have to define
-// MD4O_USE_UTF16 as true both when building MD4Odin as well as when
-// including this package in your code.
-when MD4O_USE_UTF16 {
-    when ODIN_OS == .Windows {
-        // On Windows, use u16 (equivalent to WCHAR)
-        MD_CHAR :: u16
-    } else {
-        #panic("MD4O_USE_UTF16 is only supported on Windows.")
-    }
-} else {
-    // Default to u8 (char equivalent)
-    MD_CHAR :: u8   
-}
-
-// Magic for making wide literals with MD4O_USE_UTF16.
-// In Odin, we use compile-time when statements instead of preprocessor macros.
-// String literals are UTF-8 by default, UTF-16 requires explicit conversion.
-CHAR :: distinct u16 when MD4O_USE_UTF16 else u8
-/******************************
- ***  Some internal limits  ***
- ******************************/
-
-/* We limit code span marks to lower than 32 backticks. This solves the
- * pathologic case of too many openers, each of different length: Their
- * resolving would be then O(n^2). */
-CODESPAN_MARK_MAXLEN :: 32
-
-/* We limit column count of tables to prevent quadratic explosion of output
- * from pathological input of a table thousands of columns and thousands
- * of rows where rows are requested with as little as single character
- * per-line, relying on us to "helpfully" fill all the missing "<td></td>". */
-TABLE_MAXCOLCOUNT :: 128
-
-// Misc. macros converted to Odin idioms
-// Note: Odin has built-in len() for arrays, max()/min() for comparisons,
-// and true/false for booleans. These are provided for API compatibility.
-
-// MD_LOG - logging helper
-// Call the debug_log callback if it exists
-@(private)
-md_log :: proc(ctx: ^MD_CTX, msg: string) {
-    if ctx.parser.debug_log != nil {
-        ctx.parser.debug_log(msg, ctx.userdata)
-    }
-}
-
-// MD_ASSERT - assertion with debug support
-when ODIN_DEBUG {
-    md_assert :: proc(cond: bool, loc := #caller_location) {
-        if !cond {
-            // In debug mode, log the assertion failure and panic
-            // Note: You'll need to implement MD_CTX access for full logging
-            panic("Assertion failed", loc)
+    if parser.abi_version != 0 {
+        if parser.debug_log != nil {
+            parser.debug_log("Unsupported abi_version.", userdata)
         }
+        return -1
     }
-    
-    md_unreachable :: proc(loc := #caller_location) -> ! {
-        panic("Unreachable code reached", loc)
+
+    /* Setup context structure. */
+    ctx.text = &utf8.string_to_runes(text)
+    ctx.size = len(ctx.text)
+    mem.copy(&ctx.parser, parser, size_of(MD_PARSER))
+    ctx.userdata = userdata
+    ctx.code_indent_offset = .NOINDENTEDCODEBLOCKS in ctx.parser.flags ? OFF(-1) : 4
+    md_build_mark_char_map(&ctx)
+    ctx.doc_ends_with_newline = (size > 0  &&  ISNEWLINE_(rune(text[size-1])))
+    ctx.max_ref_def_output = uint(min(min(16 * u64(size), u64(1024 * 1024)), u64(SZ_MAX)))
+
+    /* Reset all mark stacks and lists. */
+    for i = 0; i < len(ctx.opener_stacks); i+=1 {
+        ctx.opener_stacks[cast(MD_OPENER_STACKS_TYPES)i].top = -1
     }
-} else {
-    md_assert :: #force_inline proc(cond: bool) {
-        // In release mode, give a hint to the compiler
-        if !cond {
-            unreachable()
-        }
-    }
-    
-    md_unreachable :: #force_inline proc() -> ! {
-        unreachable()
-    }
+    ctx.ptr_stack.top = -1
+    ctx.unresolved_link_head = -1
+    ctx.unresolved_link_tail = -1
+    ctx.table_cell_boundaries_head = -1
+    ctx.table_cell_boundaries_tail = -1
+
+    /* All the work. */
+    ret = md_process_doc(&ctx);
+
+    /* Clean-up. */
+    md_free_ref_defs(&ctx)
+    md_free_ref_def_hashtable(&ctx)
+    if ctx.buffer != nil { delete(ctx.buffer^) }
+    if ctx.marks != nil { delete(ctx.marks^) } 
+    //free(ctx.block_bytes) // TODO: Check if slice or rawptr
+    //free(ctx.containers)
+    if ctx.unicode_maps.whitespace != nil { 
+        delete(ctx.unicode_maps.whitespace^) }
+    if ctx.unicode_maps.punctuation != nil { delete(ctx.unicode_maps.punctuation^) }
+
+
+    return ret;
 }
